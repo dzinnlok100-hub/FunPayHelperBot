@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "funpay-tg-notifier"
+version = "0.1.0"
+description = "Telegram notifier for FunPay seller activity (new messages, orders, status changes, auto-reply)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "dzinnlok100" }]
+dependencies = [
+    "FunPayAPI>=1.1.0",
+    "aiogram>=3.4,<4",
+    "aiosqlite>=0.19",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+funpay-tg-notifier = "funpay_tg_notifier.__main__:run"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+funpay_tg_notifier = ["py.typed"]

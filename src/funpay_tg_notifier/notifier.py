@@ -1,4 +1,4 @@
-"""Formats and dispatches Telegram notifications for FunPay events."""
+"""Formats and dispatches per-user Telegram notifications for FunPay events."""
 
 from __future__ import annotations
 
@@ -23,7 +23,9 @@ log = logging.getLogger(__name__)
 
 STATE_AUTOREPLY_ENABLED = "autoreply_enabled"
 STATE_AUTOREPLY_TEXT = "autoreply_text"
-DEFAULT_AUTOREPLY_TEXT = "Здравствуйте! Я скоро вернусь и отвечу — обычно в течение 5–10 минут."
+DEFAULT_AUTOREPLY_TEXT = (
+    "Здравствуйте! Я скоро вернусь и отвечу — обычно в течение 5–10 минут."
+)
 
 
 def _esc(text: str | None) -> str:
@@ -39,64 +41,56 @@ def _truncate(text: str, limit: int = 800) -> str:
 
 
 class Notifier:
-    """Routes FunPay events to Telegram and (optionally) sends auto-replies on FunPay."""
+    """Routes FunPay events to a specific Telegram user."""
 
-    def __init__(self, bot: Bot, db: Database, telegram_chat_id: int) -> None:
+    def __init__(self, bot: Bot, db: Database) -> None:
         self.bot = bot
         self.db = db
-        self.chat_id = telegram_chat_id
-        self.account: Account | None = None
 
-    def set_account(self, account: Account) -> None:
-        self.account = account
-
-    async def _send(self, text: str) -> None:
+    async def send(self, tg_user_id: int, text: str) -> bool:
+        """Send a message to a specific Telegram user. Returns True on success."""
         try:
             await self.bot.send_message(
-                self.chat_id,
+                tg_user_id,
                 text,
                 parse_mode="HTML",
                 disable_web_page_preview=True,
             )
+            return True
         except TelegramBadRequest as e:
-            if "chat not found" in str(e).lower():
-                me = None
-                try:
-                    me = await self.bot.get_me()
-                except Exception:
-                    pass
-                bot_handle = f"@{me.username}" if me and me.username else "твоему боту"
-                log.error(
-                    "Telegram вернул 'chat not found' для chat_id=%s. "
-                    "Открой %s в Telegram и нажми /start — до этого бот не может тебе писать.",
-                    self.chat_id,
-                    bot_handle,
+            msg = str(e).lower()
+            if "chat not found" in msg or "blocked by the user" in msg or "user is deactivated" in msg:
+                log.warning(
+                    "Telegram user %s is unreachable (%s) — disabling.",
+                    tg_user_id, e,
                 )
+                await self.db.set_enabled(tg_user_id, False)
             else:
-                log.exception("Failed to send Telegram message: %s", e)
+                log.exception("Failed to send Telegram message to %s: %s", tg_user_id, e)
+            return False
         except TelegramAPIError as e:
-            log.exception("Failed to send Telegram message: %s", e)
+            log.exception("Failed to send Telegram message to %s: %s", tg_user_id, e)
+            return False
 
     # ---- event handlers ----
 
-    async def handle_new_message(self, event: "NewMessageEvent") -> None:
-        if self.account is None:
-            return
+    async def handle_new_message(
+        self,
+        tg_user_id: int,
+        account: "Account",
+        event: "NewMessageEvent",
+    ) -> None:
         msg = event.message
 
-        # Skip our own outgoing messages.
-        if msg.author_id == self.account.id:
-            return
-        # Skip FunPay system messages (order confirmations, refunds, etc. — these come
-        # in via NewOrder/OrderStatusChanged events anyway).
-        if msg.author_id == 0:
+        # Skip our own outgoing messages and FunPay system messages.
+        if msg.author_id == account.id or msg.author_id == 0:
             return
 
         author = msg.author or "(unknown)"
-        await self.db.log_message(author, msg.chat_id, msg.text)
+        await self.db.log_message(tg_user_id, author, msg.chat_id, msg.text)
 
-        if await self.db.is_blocked(author):
-            log.info("Skipping notification — user %s is blocked", author)
+        if await self.db.is_blocked(tg_user_id, author):
+            log.info("Skipping notification — %s blocked by tg_user=%s", author, tg_user_id)
             return
 
         chat_link = f"https://funpay.com/chat/?node={msg.chat_id}"
@@ -107,34 +101,46 @@ class Notifier:
             f"Чат: <a href=\"{_esc(chat_link)}\">открыть</a>\n\n"
             f"{_esc(_truncate(body))}"
         )
-        await self._send(text)
+        await self.send(tg_user_id, text)
 
-        # Auto-reply (once per chat).
-        if await self._autoreply_enabled() and not await self.db.autoreply_already_sent(msg.chat_id):
-            reply_text = await self._autoreply_text()
+        # Auto-reply on FunPay (once per chat).
+        autoreply_on = (
+            await self.db.get_state(tg_user_id, STATE_AUTOREPLY_ENABLED, "0") == "1"
+        )
+        if autoreply_on and not await self.db.autoreply_already_sent(tg_user_id, msg.chat_id):
+            reply_text = (
+                await self.db.get_state(
+                    tg_user_id, STATE_AUTOREPLY_TEXT, DEFAULT_AUTOREPLY_TEXT
+                )
+                or DEFAULT_AUTOREPLY_TEXT
+            )
             try:
-                self.account.send_message(msg.chat_id, reply_text, chat_name=author)
-                await self.db.mark_autoreply_sent(msg.chat_id)
-                await self._send(
-                    f"🤖 Автоответ отправлен пользователю <b>{_esc(author)}</b>"
+                account.send_message(msg.chat_id, reply_text, chat_name=author)
+                await self.db.mark_autoreply_sent(tg_user_id, msg.chat_id)
+                await self.send(
+                    tg_user_id,
+                    f"🤖 Автоответ отправлен пользователю <b>{_esc(author)}</b>",
                 )
             except Exception as e:
-                log.exception("Auto-reply send failed: %s", e)
-                await self._send(
-                    f"⚠️ Не удалось отправить автоответ <b>{_esc(author)}</b>: {_esc(str(e))}"
+                log.exception("Auto-reply send failed for tg_user=%s: %s", tg_user_id, e)
+                await self.send(
+                    tg_user_id,
+                    f"⚠️ Не удалось отправить автоответ <b>{_esc(author)}</b>: {_esc(str(e))}",
                 )
 
-    async def handle_new_order(self, event: "NewOrderEvent") -> None:
+    async def handle_new_order(self, tg_user_id: int, event: "NewOrderEvent") -> None:
         order = event.order
+        status_name = order.status.name if hasattr(order.status, "name") else str(order.status)
         await self.db.upsert_order(
+            tg_user_id,
             order.id,
             order.buyer_username,
             float(order.price),
             order.description,
-            order.status.name if hasattr(order.status, "name") else str(order.status),
+            status_name,
         )
 
-        if await self.db.is_blocked(order.buyer_username):
+        if await self.db.is_blocked(tg_user_id, order.buyer_username):
             return
 
         order_link = f"https://funpay.com/orders/{order.id}/"
@@ -150,12 +156,15 @@ class Notifier:
             f"Заказ: <a href=\"{_esc(order_link)}\">#{_esc(order.id)}</a>"
             f" · <a href=\"{_esc(chat_link)}\">чат с покупателем</a>"
         )
-        await self._send(text)
+        await self.send(tg_user_id, text)
 
-    async def handle_order_status_changed(self, event: "OrderStatusChangedEvent") -> None:
+    async def handle_order_status_changed(
+        self, tg_user_id: int, event: "OrderStatusChangedEvent"
+    ) -> None:
         order = event.order
         status_name = order.status.name if hasattr(order.status, "name") else str(order.status)
         await self.db.upsert_order(
+            tg_user_id,
             order.id,
             order.buyer_username,
             float(order.price),
@@ -172,32 +181,13 @@ class Notifier:
             f"Сумма: <b>{order.price:.2f} ₽</b>\n"
             f"Заказ: <a href=\"{_esc(order_link)}\">#{_esc(order.id)}</a>"
         )
-        await self._send(text)
+        await self.send(tg_user_id, text)
 
-    async def handle_runner_error(self, exc: BaseException) -> None:
-        """Called when the FunPay runner crashes (cookie expired, network, etc.)."""
+    async def handle_runner_error(self, tg_user_id: int, exc: BaseException) -> None:
         text = (
             "⚠️ <b>FunPay недоступен или сессия истекла</b>\n"
             f"Ошибка: <code>{_esc(_truncate(str(exc), 400))}</code>\n\n"
-            "Если это длится дольше пары минут — проверь, не разлогинило ли тебя "
-            "на funpay.com, и обнови <code>FUNPAY_GOLDEN_KEY</code> в .env."
+            "Скорее всего твой <code>golden_key</code> протух. Залогинься на funpay.com заново, "
+            "достань новую куку и отправь её мне командой <code>/setkey НОВЫЙ_КЛЮЧ</code>."
         )
-        await self._send(text)
-
-    async def handle_startup(self, username: str | None, balance: str | None) -> None:
-        text = (
-            "🟢 <b>Бот запущен</b>\n"
-            f"FunPay аккаунт: <b>{_esc(username or '(неизвестно)')}</b>\n"
-            + (f"Баланс: {_esc(balance)}\n" if balance else "")
-            + "Команды: /help"
-        )
-        await self._send(text)
-
-    # ---- autoreply state ----
-
-    async def _autoreply_enabled(self) -> bool:
-        v = await self.db.get_state(STATE_AUTOREPLY_ENABLED, "0")
-        return v == "1"
-
-    async def _autoreply_text(self) -> str:
-        return await self.db.get_state(STATE_AUTOREPLY_TEXT, DEFAULT_AUTOREPLY_TEXT) or DEFAULT_AUTOREPLY_TEXT
+        await self.send(tg_user_id, text)

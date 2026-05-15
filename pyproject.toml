@@ -15,6 +15,7 @@ dependencies = [
     "aiogram>=3.4,<4",
     "aiosqlite>=0.19",
     "python-dotenv>=1.0",
+    "cryptography>=42",
 ]
 
 [project.scripts]

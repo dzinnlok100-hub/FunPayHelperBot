@@ -5,13 +5,74 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from bs4 import BeautifulSoup
+
 from .db import Database
 
 if TYPE_CHECKING:
     from FunPayAPI import Account
-    from FunPayAPI.types import Balance
+    from FunPayAPI.types import Balance, LotFields
 
 log = logging.getLogger(__name__)
+
+
+def get_lot_fields_safe(acc: "Account", lot_id: int) -> "LotFields":
+    """Like ``Account.get_lot_fields`` but tolerant of FunPay returning raw HTML
+    instead of a ``{"html": ...}`` JSON envelope.
+
+    FunPay's ``lots/offerEdit`` endpoint switched from JSON to plain HTML at
+    some point, which makes the upstream FunPayAPI implementation throw
+    ``JSONDecodeError: Expecting value: line 1 column 1 (char 0)``.  We do the
+    same field-extraction, but parse the raw response text directly.
+    """
+    from FunPayAPI import types as ft
+    from FunPayAPI import exceptions as fexc
+
+    if not acc.is_initiated:
+        raise fexc.AccountNotInitiatedError()
+    headers = {
+        "accept": "*/*",
+        "content-type": "application/json",
+        "x-requested-with": "XMLHttpRequest",
+    }
+    response = acc.method(
+        "get", f"lots/offerEdit?offer={lot_id}", headers, {}, raise_not_200=True
+    )
+    body = response.text or ""
+    # The endpoint may still return JSON in some deployments; handle both.
+    html = body
+    stripped = body.lstrip()
+    if stripped.startswith("{"):
+        try:
+            import json as _json
+            html = _json.loads(stripped).get("html", body)
+        except Exception:
+            html = body
+    bs = BeautifulSoup(html, "html.parser")
+
+    result: dict[str, str] = {"active": "", "deactivate_after_sale": ""}
+    for field in bs.find_all("input"):
+        name = field.get("name")
+        if not name or name in ("active", "deactivate_after_sale"):
+            continue
+        result[name] = field.get("value") or ""
+    for field in bs.find_all("textarea"):
+        name = field.get("name")
+        if not name:
+            continue
+        result[name] = field.text or ""
+    for field in bs.find_all("select"):
+        name = field.get("name")
+        if not name:
+            continue
+        selected = field.find("option", selected=True)
+        if selected is not None and selected.get("value") is not None:
+            result[name] = selected["value"]
+    for field in bs.find_all("input", {"type": "checkbox"}, checked=True):
+        name = field.get("name")
+        if name:
+            result[name] = "on"
+    return ft.LotFields(lot_id, result)
 
 _STATE_BALANCE_LOT_ID = "balance_lot_id"
 
@@ -87,7 +148,7 @@ def edit_lot(
     description_ru: str | None = None,
 ) -> None:
     """Read a lot, modify the given fields, and save it back."""
-    fields = acc.get_lot_fields(lot_id)
+    fields = get_lot_fields_safe(acc, lot_id)
     if price is not None:
         fields.price = float(price)
     if active is not None:
@@ -114,7 +175,7 @@ def clone_lot(
 
     Returns the new lot's id.
     """
-    fields = acc.get_lot_fields(lot_id)
+    fields = get_lot_fields_safe(acc, lot_id)
     if price is not None:
         fields.price = float(price)
     if title_ru is not None:
@@ -183,7 +244,7 @@ def reprice_all(
     failed = 0
     for lot in list_user_lots(acc):
         try:
-            fields = acc.get_lot_fields(int(lot.id))
+            fields = get_lot_fields_safe(acc, int(lot.id))
             if fields.price is None:
                 continue
             new_price = fields.price

@@ -1,102 +1,21 @@
-"""Application entry point: glues FunPay event runner to the aiogram Telegram bot."""
+"""Application entry point: glues the FunPay runner registry to the aiogram bot."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import threading
-import time
-from typing import Optional
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
-from FunPayAPI import Account, Runner
-from FunPayAPI.updater.events import (
-    InitialChatEvent,
-    InitialOrderEvent,
-    NewMessageEvent,
-    NewOrderEvent,
-    OrderStatusChangedEvent,
-)
 
-from .config import Settings, load_settings
+from .config import load_settings
+from .crypto import SecretCipher
 from .db import Database
-from .funpay_helpers import format_balance, get_balance_safe
 from .handlers import register_handlers
 from .notifier import Notifier
+from .runner_registry import RunnerRegistry
 
 log = logging.getLogger(__name__)
-
-# How long to wait before retrying after a Runner-level crash.
-_RUNNER_BACKOFF_SECONDS = 30
-
-
-def _funpay_thread(
-    settings: Settings,
-    notifier: Notifier,
-    account_ref: list[Optional[Account]],
-    loop: asyncio.AbstractEventLoop,
-    stop_event: threading.Event,
-    db: Database,
-) -> None:
-    """Sync polling loop. Runs in its own thread because FunPayAPI is sync."""
-    while not stop_event.is_set():
-        try:
-            account = Account(
-                settings.golden_key,
-                user_agent=settings.user_agent,
-            ).get()
-            account_ref[0] = account
-            notifier.set_account(account)
-
-            # Telegram-side startup notice (only on the very first successful login).
-            async def _startup_notice() -> None:
-                bal = await get_balance_safe(account, db)
-                await notifier.handle_startup(
-                    account.username,
-                    format_balance(bal) if bal else None,
-                )
-
-            asyncio.run_coroutine_threadsafe(_startup_notice(), loop)
-
-            runner = Runner(account)
-            log.info("FunPay runner started for account %s (id=%s)", account.username, account.id)
-
-            for event in runner.listen(requests_delay=settings.funpay_poll_delay):
-                if stop_event.is_set():
-                    break
-
-                # Skip "initial" events emitted on the first runner request — those are not
-                # new things, just whatever already exists.
-                if isinstance(event, (InitialChatEvent, InitialOrderEvent)):
-                    continue
-
-                try:
-                    if isinstance(event, NewMessageEvent):
-                        asyncio.run_coroutine_threadsafe(
-                            notifier.handle_new_message(event), loop
-                        )
-                    elif isinstance(event, NewOrderEvent):
-                        asyncio.run_coroutine_threadsafe(
-                            notifier.handle_new_order(event), loop
-                        )
-                    elif isinstance(event, OrderStatusChangedEvent):
-                        asyncio.run_coroutine_threadsafe(
-                            notifier.handle_order_status_changed(event), loop
-                        )
-                except Exception:
-                    log.exception("Error while dispatching FunPay event %r", event)
-        except Exception as exc:
-            log.exception("FunPay runner crashed; will retry in %ss", _RUNNER_BACKOFF_SECONDS)
-            try:
-                asyncio.run_coroutine_threadsafe(
-                    notifier.handle_runner_error(exc), loop
-                )
-            except Exception:
-                log.exception("Failed to schedule runner-error notification")
-            # Backoff before reconnecting.
-            if stop_event.wait(_RUNNER_BACKOFF_SECONDS):
-                break
 
 
 async def _amain() -> None:
@@ -105,8 +24,11 @@ async def _amain() -> None:
         level=getattr(logging, settings.log_level, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    logging.getLogger("aiosqlite").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
 
-    db = Database(settings.db_path)
+    cipher = SecretCipher(settings.encryption_key)
+    db = Database(settings.db_path, cipher)
     await db.init()
 
     bot = Bot(
@@ -114,32 +36,37 @@ async def _amain() -> None:
         default=DefaultBotProperties(parse_mode="HTML"),
     )
     dp = Dispatcher()
-    notifier = Notifier(bot, db, settings.telegram_chat_id)
-
-    account_ref: list[Optional[Account]] = [None]
-
-    def get_account() -> Optional[Account]:
-        return account_ref[0]
-
-    register_handlers(dp, db, notifier, settings.telegram_chat_id, get_account)
-
-    # Make the db accessible to the funpay polling thread.
-    funpay_db_ref = db
+    notifier = Notifier(bot, db)
 
     loop = asyncio.get_running_loop()
-    stop_event = threading.Event()
-    funpay_thread = threading.Thread(
-        target=_funpay_thread,
-        args=(settings, notifier, account_ref, loop, stop_event, funpay_db_ref),
-        name="funpay-runner",
-        daemon=True,
-    )
-    funpay_thread.start()
+    registry = RunnerRegistry(db, notifier, loop, settings.funpay_poll_delay)
+
+    register_handlers(dp, bot, db, notifier, registry, settings.admin_tg_user_id)
+
+    # Auto-resume all previously enabled users on startup.
+    known_users = await db.list_users(only_enabled=True)
+    log.info("Resuming %d previously-active users", len(known_users))
+    for u in known_users:
+        try:
+            registry.start(u.tg_user_id, u.golden_key, u.user_agent)
+        except Exception:
+            log.exception("Failed to start runner for tg_user=%s", u.tg_user_id)
+
+    # Notify admin (if configured) that the bot is up.
+    if settings.admin_tg_user_id:
+        try:
+            await notifier.send(
+                settings.admin_tg_user_id,
+                f"🟢 Бот запущен. Возобновил {len(known_users)} активных пользователей.",
+            )
+        except Exception:
+            log.exception("Could not notify admin on startup")
 
     try:
         await dp.start_polling(bot, handle_signals=True)
     finally:
-        stop_event.set()
+        log.info("Shutting down, stopping all FunPay runners...")
+        registry.stop_all()
         await bot.session.close()
 
 

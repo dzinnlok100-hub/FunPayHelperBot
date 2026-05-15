@@ -7,7 +7,9 @@ import logging
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.fsm.storage.memory import MemoryStorage
 
+from .background import background_loop
 from .config import load_settings
 from .crypto import SecretCipher
 from .db import Database
@@ -35,7 +37,7 @@ async def _amain() -> None:
         token=settings.telegram_token,
         default=DefaultBotProperties(parse_mode="HTML"),
     )
-    dp = Dispatcher()
+    dp = Dispatcher(storage=MemoryStorage())
     notifier = Notifier(bot, db)
 
     loop = asyncio.get_running_loop()
@@ -62,10 +64,22 @@ async def _amain() -> None:
         except Exception:
             log.exception("Could not notify admin on startup")
 
+    bg_stop_event = asyncio.Event()
+    bg_task = asyncio.create_task(
+        background_loop(db, registry, notifier, bg_stop_event),
+        name="background_loop",
+    )
+
     try:
         await dp.start_polling(bot, handle_signals=True)
     finally:
-        log.info("Shutting down, stopping all FunPay runners...")
+        log.info("Shutting down, stopping background tasks and FunPay runners...")
+        bg_stop_event.set()
+        try:
+            await asyncio.wait_for(bg_task, timeout=5)
+        except asyncio.TimeoutError:
+            log.warning("background loop did not stop in time, cancelling")
+            bg_task.cancel()
         registry.stop_all()
         await bot.session.close()
 

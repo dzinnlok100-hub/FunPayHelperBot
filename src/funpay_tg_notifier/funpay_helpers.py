@@ -189,7 +189,8 @@ def clone_lot(
     title_ru: str | None = None,
 ) -> int:
     """Duplicate an existing lot. The lot is saved with no offer_id so FunPay
-    treats it as a fresh entity.
+    treats it as a fresh entity. ``node_id`` (the subcategory) is preserved
+    — without it FunPay rejects the save.
 
     Returns the new lot's id.
     """
@@ -198,9 +199,10 @@ def clone_lot(
         fields.price = float(price)
     if title_ru is not None:
         fields.title_ru = title_ru
-    # Drop the offer_id so save_lot treats this as a new offer.
+    # Drop only the offer_id — that's what makes save_lot treat this as a new
+    # offer. Keep node_id (subcategory), csrf_token, form_created_at.
     raw = fields.fields
-    for key in ("offer_id", "offer_id[]", "node_id"):
+    for key in ("offer_id", "offer_id[]"):
         raw.pop(key, None)
     fields.lot_id = 0
     fields.renew_fields()
@@ -213,6 +215,27 @@ def clone_lot(
         if str(lot.description or "").strip() == target:
             return int(lot.id)
     return 0
+
+
+def format_funpay_exc(exc: BaseException, max_len: int = 500) -> str:
+    """Return a short, human-readable error string for a FunPayAPI exception.
+
+    Upstream exceptions like ``LotSavingError`` have a useful ``error_message``
+    attribute but ``str(exc)`` dumps the entire POST body (kilobytes of
+    URL-encoded form data) which blows past Telegram's 4096-char limit.
+    """
+    msg = getattr(exc, "error_message", None) or getattr(exc, "short_str", None)
+    if callable(msg):
+        try:
+            msg = msg()
+        except Exception:
+            msg = None
+    if not msg:
+        msg = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+    msg = str(msg)
+    if len(msg) > max_len:
+        msg = msg[: max_len - 1] + "…"
+    return msg
 
 
 def bump_user_lots(acc: "Account") -> tuple[set[str], set[str]]:

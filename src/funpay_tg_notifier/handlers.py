@@ -21,6 +21,7 @@ from .funpay_helpers import (
     clone_lot,
     edit_lot,
     format_balance,
+    format_funpay_exc,
     get_balance_safe,
     list_user_lots,
     reprice_all,
@@ -224,7 +225,7 @@ def register_handlers(
         except Exception as e:
             await progress.edit_text(
                 "❌ Не удалось залогиниться: "
-                f"<code>{_esc(type(e).__name__)}: {_esc(str(e))}</code>\n\n"
+                f"<code>{_esc(type(e).__name__)}: {_esc(format_funpay_exc(e))}</code>\n\n"
                 "Перепроверь, что скопировал значение cookie <b>golden_key</b> "
                 "целиком и без пробелов. Если только что менял пароль на FunPay — "
                 "старая кука протухла, нужна свежая."
@@ -384,7 +385,7 @@ def register_handlers(
             n7, sum7 = await asyncio.to_thread(sum_paid_orders_via_api, acc, 7)
             n30, sum30 = await asyncio.to_thread(sum_paid_orders_via_api, acc, 30)
         except Exception as e:
-            await progress.edit_text(f"❌ Не получилось: <code>{_esc(str(e))}</code>")
+            await progress.edit_text(f"❌ Не получилось: <code>{_esc(format_funpay_exc(e))}</code>")
             return
         await progress.edit_text(
             "<b>Выручка (PAID + CLOSED)</b>\n"
@@ -537,7 +538,7 @@ def register_handlers(
                 new_text.format(name="test", order="42", lot="lot")
             except (KeyError, IndexError, ValueError) as e:
                 await message.answer(
-                    f"❌ Текст не принят: <code>{_esc(str(e))}</code>\n"
+                    f"❌ Текст не принят: <code>{_esc(format_funpay_exc(e))}</code>\n"
                     "Используй только плейсхолдеры <code>{name}</code>, "
                     "<code>{order}</code>, <code>{lot}</code>."
                 )
@@ -629,7 +630,7 @@ def register_handlers(
         try:
             lots = await asyncio.to_thread(list_user_lots, acc)
         except Exception as e:
-            await message.answer(f"❌ Не удалось получить лоты: <code>{_esc(str(e))}</code>")
+            await message.answer(f"❌ Не удалось получить лоты: <code>{_esc(format_funpay_exc(e))}</code>")
             return
         if not lots:
             await message.answer("Активных лотов нет.")
@@ -683,7 +684,7 @@ def register_handlers(
         try:
             await asyncio.to_thread(edit_lot, acc, lot_id, price=new_price)
         except Exception as e:
-            await message.answer(f"❌ <code>{_esc(str(e))}</code>")
+            await message.answer(f"❌ <code>{_esc(format_funpay_exc(e))}</code>")
             return
         await message.answer(
             f"💰 Лот <code>{lot_id}</code> теперь стоит <b>{new_price:.2f} ₽</b>"
@@ -709,7 +710,7 @@ def register_handlers(
         try:
             await asyncio.to_thread(edit_lot, acc, lot_id, active=active)
         except Exception as e:
-            await message.answer(f"❌ <code>{_esc(str(e))}</code>")
+            await message.answer(f"❌ <code>{_esc(format_funpay_exc(e))}</code>")
             return
         await message.answer(f"Лот <code>{lot_id}</code> {label}.")
 
@@ -728,7 +729,7 @@ def register_handlers(
         try:
             bumped, failed = await asyncio.to_thread(bump_user_lots, acc)
         except Exception as e:
-            await progress.edit_text(f"❌ <code>{_esc(str(e))}</code>")
+            await progress.edit_text(f"❌ <code>{_esc(format_funpay_exc(e))}</code>")
             return
         if not bumped and not failed:
             await progress.edit_text("Нет лотов для поднятия.")
@@ -803,7 +804,7 @@ def register_handlers(
                 clone_lot, acc, lot_id, price=new_price
             )
         except Exception as e:
-            await progress.edit_text(f"❌ <code>{_esc(str(e))}</code>")
+            await progress.edit_text(f"❌ <code>{_esc(format_funpay_exc(e))}</code>")
             return
         if new_id:
             await progress.edit_text(
@@ -828,7 +829,7 @@ def register_handlers(
         try:
             lots = await asyncio.to_thread(list_user_lots, acc)
         except Exception as e:
-            await message.answer(f"❌ Не получилось получить лоты: <code>{_esc(str(e))}</code>")
+            await message.answer(f"❌ Не получилось получить лоты: <code>{_esc(format_funpay_exc(e))}</code>")
             return
         if not lots:
             await message.answer(
@@ -897,7 +898,7 @@ def register_handlers(
                 clone_lot, acc, lot_id, price=new_price, title_ru=title
             )
         except Exception as e:
-            await progress.edit_text(f"❌ <code>{_esc(str(e))}</code>")
+            await progress.edit_text(f"❌ <code>{_esc(format_funpay_exc(e))}</code>")
             return
         await progress.edit_text(
             "📋 Новый лот создан"
@@ -937,7 +938,7 @@ def register_handlers(
                 upd, fail = await asyncio.to_thread(reprice_all, acc, delta=delta)
                 label = f"{'+' if delta >= 0 else ''}{delta} ₽"
         except Exception as e:
-            await progress.edit_text(f"❌ <code>{_esc(str(e))}</code>")
+            await progress.edit_text(f"❌ <code>{_esc(format_funpay_exc(e))}</code>")
             return
         await progress.edit_text(
             f"✅ Перецененно: <b>{upd}</b> ({label})\n"
@@ -1177,7 +1178,7 @@ def register_handlers(
                 lambda: acc.send_message(int(chat_id), text)
             )
         except Exception as e:
-            await message.answer(f"❌ Не отправилось: <code>{_esc(str(e))}</code>")
+            await message.answer(f"❌ Не отправилось: <code>{_esc(format_funpay_exc(e))}</code>")
             await state.clear()
             return
         await message.answer("✅ Отправил.")

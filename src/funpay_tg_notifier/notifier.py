@@ -49,8 +49,9 @@ DEFAULT_AUTOREPLY_QUIET_TEXT = (
 )
 DEFAULT_REVIEW_ASK_TEXT = (
     "🙏 Спасибо за покупку, {name}!\n"
-    "Если всё устроило — буду очень благодарен за ⭐⭐⭐⭐⭐ отзыв "
-    "к заказу #{order}. Это правда помогает 💛\n"
+    "Если всё устроило — буду очень благодарен за ⭐⭐⭐⭐⭐ отзыв к заказу: "
+    "{order_url}\n"
+    "Это правда помогает 💛\n"
     "Если что-то пошло не так — напишите, постараюсь решить."
 )
 
@@ -398,10 +399,12 @@ class Notifier:
             )
             or DEFAULT_REVIEW_ASK_TEXT
         )
+        order_url = f"https://funpay.com/orders/{order.id}/"
         try:
             msg_text = template.format(
                 name=order.buyer_username,
                 order=order.id,
+                order_url=order_url,
                 lot=order.description or "",
             )
         except (KeyError, IndexError, ValueError) as e:
@@ -409,6 +412,7 @@ class Notifier:
             msg_text = DEFAULT_REVIEW_ASK_TEXT.format(
                 name=order.buyer_username,
                 order=order.id,
+                order_url=order_url,
                 lot=order.description or "",
             )
 

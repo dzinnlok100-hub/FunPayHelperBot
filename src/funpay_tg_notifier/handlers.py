@@ -117,7 +117,7 @@ HELP_TEXT = (
     "/autoreply show\n\n"
     "<b>Авто-запрос отзыва</b>\n"
     "/reviewask on|off — писать покупателю при закрытии заказа\n"
-    "/reviewask set &lt;текст&gt; — свой текст (плейсхолдеры {name}, {order}, {lot})\n"
+    "/reviewask set &lt;текст&gt; — свой текст (плейсхолдеры {name}, {order}, {order_url}, {lot})\n"
     "/reviewask show — посмотреть текущий текст\n\n"
     "<b>Лоты и поднятие</b>\n"
     "/lot_pause &lt;id&gt; · /lot_resume &lt;id&gt; · /lot_price &lt;id&gt; &lt;цена&gt;\n"
@@ -507,7 +507,9 @@ def register_handlers(
                 f"<b>{'ON' if enabled else 'OFF'}</b>\n\n"
                 f"Текст:\n<pre>{_esc(text_now or '')}</pre>\n\n"
                 "Плейсхолдеры: <code>{name}</code> (ник покупателя), "
-                "<code>{order}</code> (номер), <code>{lot}</code> (название лота).\n\n"
+                "<code>{order}</code> (номер), "
+                "<code>{order_url}</code> (ссылка на заказ — FunPay сделает её кликабельной), "
+                "<code>{lot}</code> (название лота).\n\n"
                 "Команды:\n"
                 "  /reviewask on  /reviewask off\n"
                 "  /reviewask set &lt;текст&gt;\n"
@@ -536,12 +538,18 @@ def register_handlers(
                 return
             # Validate placeholders won't blow up.
             try:
-                new_text.format(name="test", order="42", lot="lot")
+                new_text.format(
+                    name="test",
+                    order="42",
+                    order_url="https://funpay.com/orders/42/",
+                    lot="lot",
+                )
             except (KeyError, IndexError, ValueError) as e:
                 await message.answer(
                     f"❌ Текст не принят: <code>{_esc(format_funpay_exc(e))}</code>\n"
                     "Используй только плейсхолдеры <code>{name}</code>, "
-                    "<code>{order}</code>, <code>{lot}</code>."
+                    "<code>{order}</code>, <code>{order_url}</code>, "
+                    "<code>{lot}</code>."
                 )
                 return
             await db.set_state(tg_id, STATE_REVIEW_ASK_TEXT, new_text)

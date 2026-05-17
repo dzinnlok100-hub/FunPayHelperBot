@@ -13,7 +13,7 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .db import Database
-from .funpay_helpers import format_money
+from .funpay_helpers import format_money, safe_send_message
 
 if TYPE_CHECKING:
     from FunPayAPI import Account
@@ -222,7 +222,8 @@ class Notifier:
                 )
             try:
                 await asyncio.to_thread(
-                    lambda: account.send_message(msg.chat_id, reply_text, chat_name=author)
+                    safe_send_message,
+                    account, int(msg.chat_id), reply_text, author,
                 )
                 await self.db.mark_autoreply_sent(tg_user_id, msg.chat_id)
                 await self.send(
@@ -315,9 +316,8 @@ class Notifier:
 
         try:
             await asyncio.to_thread(
-                lambda: account.send_message(
-                    chat_id_to_send, content, chat_name=order.buyer_username
-                )
+                safe_send_message,
+                account, chat_id_to_send, content, order.buyer_username,
             )
         except Exception as e:
             log.exception("Autodeliver send_message failed: %s", e)
@@ -433,9 +433,8 @@ class Notifier:
 
         try:
             await asyncio.to_thread(
-                lambda: account.send_message(
-                    chat_id_to_send, msg_text, chat_name=order.buyer_username
-                )
+                safe_send_message,
+                account, chat_id_to_send, msg_text, order.buyer_username,
             )
         except Exception as e:
             log.exception("review-ask send_message failed: %s", e)

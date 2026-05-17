@@ -217,6 +217,33 @@ def clone_lot(
     return 0
 
 
+def safe_send_message(
+    acc: "Account",
+    chat_id: int,
+    text: str,
+    chat_name: str | None = None,
+) -> None:
+    """Send a chat message via FunPay, tolerating upstream response-parsing
+    crashes.
+
+    FunPayAPI's ``Account.send_message`` POSTs the message and then tries to
+    parse FunPay's response HTML to build a :class:`Message` return object.
+    When FunPay changes the response markup (e.g. drops the
+    ``message-text`` div), the parser raises ``AttributeError: 'NoneType'
+    object has no attribute 'text'`` — but by that point FunPay has already
+    accepted and delivered the message. Since our callers never use the
+    return value, we ignore this specific class of post-send error.
+    """
+    try:
+        acc.send_message(chat_id, text, chat_name=chat_name)
+    except AttributeError as e:
+        # 'NoneType' object has no attribute 'text' is the canonical signature.
+        log.warning(
+            "send_message: ignoring upstream response-parse crash "
+            "(message was delivered): %s", e,
+        )
+
+
 def format_funpay_exc(exc: BaseException, max_len: int = 500) -> str:
     """Return a short, human-readable error string for a FunPayAPI exception.
 

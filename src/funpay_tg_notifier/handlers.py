@@ -25,6 +25,7 @@ from .funpay_helpers import (
     get_balance_safe,
     list_user_lots,
     reprice_all,
+    safe_send_message,
     sum_paid_orders_via_api,
 )
 from .notifier import (
@@ -1141,10 +1142,10 @@ def register_handlers(
             return
         try:
             await asyncio.to_thread(
-                lambda: acc.send_message(int(chat_id_raw), text)
+                safe_send_message, acc, int(chat_id_raw), text, None,
             )
         except Exception as e:
-            await cb.answer(f"Ошибка: {e}"[:200], show_alert=True)
+            await cb.answer(f"Ошибка: {format_funpay_exc(e, max_len=180)}", show_alert=True)
             return
         await cb.answer(f"📝 Отправлен шаблон «{name}»")
 
@@ -1175,7 +1176,7 @@ def register_handlers(
             return
         try:
             await asyncio.to_thread(
-                lambda: acc.send_message(int(chat_id), text)
+                safe_send_message, acc, int(chat_id), text, None,
             )
         except Exception as e:
             await message.answer(f"❌ Не отправилось: <code>{_esc(format_funpay_exc(e))}</code>")

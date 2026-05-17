@@ -44,7 +44,7 @@ def load_settings() -> Settings:
         telegram_token=_required("TELEGRAM_BOT_TOKEN"),
         admin_tg_user_id=admin_id,
         encryption_key=_required("ENCRYPTION_KEY").encode(),
-        funpay_poll_delay=float(os.environ.get("FUNPAY_POLL_DELAY", "6")),
+        funpay_poll_delay=float(os.environ.get("FUNPAY_POLL_DELAY", "2")),
         db_path=db_path,
         log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     )

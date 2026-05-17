@@ -13,6 +13,7 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .db import Database
+from .funpay_helpers import format_money
 
 if TYPE_CHECKING:
     from FunPayAPI import Account
@@ -251,7 +252,7 @@ class Notifier:
                 f"Покупатель: <b>{_esc(order.buyer_username)}</b>\n"
                 f"Лот: {_esc(order.description)}\n"
                 f"Категория: {_esc(order.subcategory_name)}\n"
-                f"Сумма: <b>{order.price:.2f} ₽</b>\n"
+                f"Сумма: <b>{_esc(format_money(order.price))}</b>\n"
                 f"Заказ: <a href=\"{_esc(order_link)}\">#{_esc(order.id)}</a>"
                 f" · <a href=\"{_esc(chat_link)}\">чат с покупателем</a>"
             )
@@ -357,7 +358,7 @@ class Notifier:
             f"{emoji} <b>Статус заказа: {_esc(status_name)}</b>\n"
             f"Покупатель: <b>{_esc(order.buyer_username)}</b>\n"
             f"Лот: {_esc(order.description)}\n"
-            f"Сумма: <b>{order.price:.2f} ₽</b>\n"
+            f"Сумма: <b>{_esc(format_money(order.price))}</b>\n"
             f"Заказ: <a href=\"{_esc(order_link)}\">#{_esc(order.id)}</a>"
             f"{extra}"
         )

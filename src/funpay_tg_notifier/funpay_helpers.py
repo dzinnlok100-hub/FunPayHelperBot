@@ -122,10 +122,28 @@ async def get_balance_safe(
     return None
 
 
+def format_money(value: float | int | None, currency: str = "₽") -> str:
+    """Format a number as a price with space-separated thousands.
+
+    Examples: 1500.0 → "1 500.00 ₽", 83.092 → "83.09 ₽", None → "—".
+    """
+    if value is None:
+        return "—"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    # Russian convention: space as thousands separator, dot as decimal.
+    integer_part, _, frac_part = f"{v:,.2f}".partition(".")
+    integer_part = integer_part.replace(",", " ")
+    formatted = f"{integer_part}.{frac_part}" if frac_part else integer_part
+    return f"{formatted} {currency}".strip()
+
+
 def format_balance(bal: "Balance | None") -> str:
     if bal is None:
         return "—"
-    return f"{bal.total_rub:.2f} ₽ (доступно {bal.available_rub:.2f} ₽)"
+    return f"{format_money(bal.total_rub)} (доступно {format_money(bal.available_rub)})"
 
 
 # ---- lot management helpers (synchronous: call via asyncio.to_thread) ----

@@ -155,7 +155,9 @@ class RunnerRegistry:
                             )
                         elif isinstance(event, OrderStatusChangedEvent):
                             asyncio.run_coroutine_threadsafe(
-                                self.notifier.handle_order_status_changed(tg_user_id, event),
+                                self.notifier.handle_order_status_changed(
+                                    tg_user_id, account, event
+                                ),
                                 self.loop,
                             )
                     except Exception:

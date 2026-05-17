@@ -29,6 +29,7 @@ from .funpay_helpers import (
 from .notifier import (
     DEFAULT_AUTOREPLY_QUIET_TEXT,
     DEFAULT_AUTOREPLY_TEXT,
+    DEFAULT_REVIEW_ASK_TEXT,
     Notifier,
     STATE_AUTODELIVER_ENABLED,
     STATE_AUTOBUMP_ENABLED,
@@ -41,6 +42,8 @@ from .notifier import (
     STATE_QUIET_ENABLED,
     STATE_QUIET_END_MIN,
     STATE_QUIET_START_MIN,
+    STATE_REVIEW_ASK_ENABLED,
+    STATE_REVIEW_ASK_TEXT,
 )
 from .runner_registry import RunnerRegistry
 
@@ -110,6 +113,10 @@ HELP_TEXT = (
     "/autoreply set &lt;текст&gt;\n"
     "/autoreply quiet &lt;текст&gt; — ответ в тихие часы\n"
     "/autoreply show\n\n"
+    "<b>Авто-запрос отзыва</b>\n"
+    "/reviewask on|off — писать покупателю при закрытии заказа\n"
+    "/reviewask set &lt;текст&gt; — свой текст (плейсхолдеры {name}, {order}, {lot})\n"
+    "/reviewask show — посмотреть текущий текст\n\n"
     "<b>Лоты и поднятие</b>\n"
     "/lot_pause &lt;id&gt; · /lot_resume &lt;id&gt; · /lot_price &lt;id&gt; &lt;цена&gt;\n"
     "/bump — поднять все лоты в верх категории\n"
@@ -306,6 +313,9 @@ def register_handlers(
         autobump_on = await db.get_state(tg_id, STATE_AUTOBUMP_ENABLED, "0") == "1"
         digest_on = await db.get_state(tg_id, STATE_DIGEST_ENABLED, "0") == "1"
         quiet_on = await db.get_state(tg_id, STATE_QUIET_ENABLED, "0") == "1"
+        review_ask_on = (
+            await db.get_state(tg_id, STATE_REVIEW_ASK_ENABLED, "0") == "1"
+        )
         running = registry.is_running(tg_id)
         queue_left = await db.queue_count_available(tg_id)
         if acc is None:
@@ -328,7 +338,8 @@ def register_handlers(
             f"(в очереди: {queue_left})\n"
             f"  🔝 Авто-поднятие: <b>{'ON' if autobump_on else 'OFF'}</b>\n"
             f"  🌙 Тихие часы: <b>{'ON' if quiet_on else 'OFF'}</b>\n"
-            f"  📊 Ежедневная сводка: <b>{'ON' if digest_on else 'OFF'}</b>"
+            f"  📊 Ежедневная сводка: <b>{'ON' if digest_on else 'OFF'}</b>\n"
+            f"  ⭐ Авто-запрос отзыва: <b>{'ON' if review_ask_on else 'OFF'}</b>"
         )
         await message.answer(text)
 
@@ -473,6 +484,82 @@ def register_handlers(
             await message.answer(f"<pre>{_esc(text_now or '')}</pre>")
         else:
             await message.answer("Неизвестная подкоманда. /autoreply без аргументов — справка.")
+
+    # ---- /reviewask (автоматический запрос отзыва после закрытия заказа) ----
+
+    @dp.message(Command("reviewask"))
+    async def cmd_reviewask(message: Message, command: CommandObject) -> None:
+        if not await _ensure_user_or_hint(message):
+            return
+        tg_id = message.from_user.id
+        args = (command.args or "").strip()
+        if not args:
+            enabled = (
+                await db.get_state(tg_id, STATE_REVIEW_ASK_ENABLED, "0") == "1"
+            )
+            text_now = await db.get_state(
+                tg_id, STATE_REVIEW_ASK_TEXT, DEFAULT_REVIEW_ASK_TEXT
+            )
+            await message.answer(
+                "⭐ <b>Авто-запрос отзыва</b> при закрытии заказа: "
+                f"<b>{'ON' if enabled else 'OFF'}</b>\n\n"
+                f"Текст:\n<pre>{_esc(text_now or '')}</pre>\n\n"
+                "Плейсхолдеры: <code>{name}</code> (ник покупателя), "
+                "<code>{order}</code> (номер), <code>{lot}</code> (название лота).\n\n"
+                "Команды:\n"
+                "  /reviewask on  /reviewask off\n"
+                "  /reviewask set &lt;текст&gt;\n"
+                "  /reviewask reset — вернуть текст по умолчанию\n"
+                "  /reviewask show"
+            )
+            return
+        sub, _, rest = args.partition(" ")
+        sub = sub.lower()
+        if sub == "on":
+            await db.set_state(tg_id, STATE_REVIEW_ASK_ENABLED, "1")
+            await message.answer(
+                "⭐ Авто-запрос отзыва <b>ON</b> — буду писать покупателям "
+                "сразу как они подтверждают заказ."
+            )
+        elif sub == "off":
+            await db.set_state(tg_id, STATE_REVIEW_ASK_ENABLED, "0")
+            await message.answer("⭐ Авто-запрос отзыва <b>OFF</b>")
+        elif sub == "set":
+            new_text = rest.strip()
+            if not new_text:
+                await message.answer(
+                    "Укажи текст: <code>/reviewask set Спасибо, {name}! "
+                    "Оставь отзыв к заказу #{order}, если всё ок 🙏</code>"
+                )
+                return
+            # Validate placeholders won't blow up.
+            try:
+                new_text.format(name="test", order="42", lot="lot")
+            except (KeyError, IndexError, ValueError) as e:
+                await message.answer(
+                    f"❌ Текст не принят: <code>{_esc(str(e))}</code>\n"
+                    "Используй только плейсхолдеры <code>{name}</code>, "
+                    "<code>{order}</code>, <code>{lot}</code>."
+                )
+                return
+            await db.set_state(tg_id, STATE_REVIEW_ASK_TEXT, new_text)
+            await message.answer(
+                f"Текст обновлён:\n<pre>{_esc(new_text)}</pre>"
+            )
+        elif sub == "reset":
+            await db.set_state(tg_id, STATE_REVIEW_ASK_TEXT, DEFAULT_REVIEW_ASK_TEXT)
+            await message.answer(
+                f"Текст сброшен на дефолтный:\n<pre>{_esc(DEFAULT_REVIEW_ASK_TEXT)}</pre>"
+            )
+        elif sub == "show":
+            text_now = await db.get_state(
+                tg_id, STATE_REVIEW_ASK_TEXT, DEFAULT_REVIEW_ASK_TEXT
+            )
+            await message.answer(f"<pre>{_esc(text_now or '')}</pre>")
+        else:
+            await message.answer(
+                "Неизвестная подкоманда. /reviewask без аргументов — справка."
+            )
 
     # ---- /templates ----
 

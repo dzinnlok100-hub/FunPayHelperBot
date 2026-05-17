@@ -96,6 +96,13 @@ CREATE TABLE IF NOT EXISTS delivery_log (
     queue_item_id INTEGER,
     PRIMARY KEY (tg_user_id, order_id)
 );
+
+CREATE TABLE IF NOT EXISTS review_ask_log (
+    tg_user_id INTEGER NOT NULL,
+    order_id TEXT NOT NULL,
+    sent_at INTEGER NOT NULL,
+    PRIMARY KEY (tg_user_id, order_id)
+);
 """
 
 
@@ -198,6 +205,7 @@ class Database:
                 "templates",
                 "delivery_queue",
                 "delivery_log",
+                "review_ask_log",
                 "users",
             ):
                 await db.execute(f"DELETE FROM {table} WHERE tg_user_id=?", (tg_user_id,))
@@ -544,3 +552,26 @@ class Database:
                 (tg_user_id, order_id),
             )
             return await cur.fetchone() is not None
+
+    # ---- review-ask log (idempotent per order) ----
+
+    async def review_ask_already_sent(
+        self, tg_user_id: int, order_id: str
+    ) -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT 1 FROM review_ask_log WHERE tg_user_id=? AND order_id=?",
+                (tg_user_id, order_id),
+            )
+            return await cur.fetchone() is not None
+
+    async def mark_review_ask_sent(
+        self, tg_user_id: int, order_id: str
+    ) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO review_ask_log "
+                "(tg_user_id, order_id, sent_at) VALUES (?, ?, ?)",
+                (tg_user_id, order_id, int(time.time())),
+            )
+            await db.commit()

@@ -38,12 +38,20 @@ STATE_AUTOBUMP_LAST_RUN_TS = "autobump_last_run_ts"
 STATE_DIGEST_ENABLED = "digest_enabled"
 STATE_DIGEST_HOUR_UTC = "digest_hour_utc"
 STATE_DIGEST_LAST_SENT_DATE = "digest_last_sent_date"
+STATE_REVIEW_ASK_ENABLED = "review_ask_enabled"
+STATE_REVIEW_ASK_TEXT = "review_ask_text"
 
 DEFAULT_AUTOREPLY_TEXT = (
     "Здравствуйте! Я скоро вернусь и отвечу — обычно в течение 5–10 минут."
 )
 DEFAULT_AUTOREPLY_QUIET_TEXT = (
     "Здравствуйте! Сейчас у меня нерабочее время, отвечу с утра."
+)
+DEFAULT_REVIEW_ASK_TEXT = (
+    "🙏 Спасибо за покупку, {name}!\n"
+    "Если всё устроило — буду очень благодарен за ⭐⭐⭐⭐⭐ отзыв "
+    "к заказу #{order}. Это правда помогает 💛\n"
+    "Если что-то пошло не так — напишите, постараюсь решить."
 )
 
 
@@ -330,7 +338,10 @@ class Notifier:
         )
 
     async def handle_order_status_changed(
-        self, tg_user_id: int, event: "OrderStatusChangedEvent"
+        self,
+        tg_user_id: int,
+        account: "Account",
+        event: "OrderStatusChangedEvent",
     ) -> None:
         order = event.order
         status_name = (
@@ -363,6 +374,85 @@ class Notifier:
             f"{extra}"
         )
         await self.send(tg_user_id, text)
+
+        # On CLOSED (buyer confirmed receipt) — ask for a review, idempotently.
+        if status_name == "CLOSED":
+            await self._maybe_send_review_ask(tg_user_id, account, order)
+
+    async def _maybe_send_review_ask(
+        self, tg_user_id: int, account: "Account", order
+    ) -> None:
+        enabled = (
+            await self.db.get_state(tg_user_id, STATE_REVIEW_ASK_ENABLED, "0") == "1"
+        )
+        if not enabled:
+            return
+        if await self.db.review_ask_already_sent(tg_user_id, str(order.id)):
+            return
+        if await self.db.is_blocked(tg_user_id, order.buyer_username):
+            return
+
+        template = (
+            await self.db.get_state(
+                tg_user_id, STATE_REVIEW_ASK_TEXT, DEFAULT_REVIEW_ASK_TEXT
+            )
+            or DEFAULT_REVIEW_ASK_TEXT
+        )
+        try:
+            msg_text = template.format(
+                name=order.buyer_username,
+                order=order.id,
+                lot=order.description or "",
+            )
+        except (KeyError, IndexError, ValueError) as e:
+            log.warning("review-ask template format failed for tg_user=%s: %s", tg_user_id, e)
+            msg_text = DEFAULT_REVIEW_ASK_TEXT.format(
+                name=order.buyer_username,
+                order=order.id,
+                lot=order.description or "",
+            )
+
+        chat_id_to_send: int | None = None
+        try:
+            shortcut = await asyncio.to_thread(
+                lambda: account.get_chat_by_name(order.buyer_username, make_request=True)
+            )
+            if shortcut is not None:
+                chat_id_to_send = int(shortcut.id)
+        except Exception as e:
+            log.exception("review-ask get_chat_by_name failed: %s", e)
+
+        if chat_id_to_send is None:
+            await self.send(
+                tg_user_id,
+                "⚠️ <b>Запрос отзыва не отправлен:</b> не нашёл чат с "
+                f"<b>{_esc(order.buyer_username)}</b> (заказ "
+                f"<code>#{_esc(order.id)}</code>).",
+            )
+            return
+
+        try:
+            await asyncio.to_thread(
+                lambda: account.send_message(
+                    chat_id_to_send, msg_text, chat_name=order.buyer_username
+                )
+            )
+        except Exception as e:
+            log.exception("review-ask send_message failed: %s", e)
+            await self.send(
+                tg_user_id,
+                "❌ <b>Не удалось отправить запрос отзыва</b> покупателю "
+                f"<b>{_esc(order.buyer_username)}</b>: <code>{_esc(str(e))}</code>",
+            )
+            return
+
+        await self.db.mark_review_ask_sent(tg_user_id, str(order.id))
+        await self.send(
+            tg_user_id,
+            "⭐ <b>Запрос отзыва отправлен</b>\n"
+            f"Покупатель: <b>{_esc(order.buyer_username)}</b>\n"
+            f"Заказ: <code>#{_esc(order.id)}</code>",
+        )
 
     async def handle_runner_error(self, tg_user_id: int, exc: BaseException) -> None:
         text = (

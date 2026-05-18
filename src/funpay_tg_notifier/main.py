@@ -14,6 +14,7 @@ from .background import background_loop
 from .config import load_settings
 from .crypto import SecretCipher
 from .db import Database
+from . import funpay_patches
 from .handlers import register_handlers
 from .notifier import Notifier
 from .runner_registry import RunnerRegistry
@@ -29,6 +30,8 @@ async def _amain() -> None:
     )
     logging.getLogger("aiosqlite").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+    funpay_patches.apply()
 
     cipher = SecretCipher(settings.encryption_key)
     db = Database(settings.db_path, cipher)

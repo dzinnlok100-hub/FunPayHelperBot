@@ -5,13 +5,74 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from bs4 import BeautifulSoup
+
 from .db import Database
 
 if TYPE_CHECKING:
     from FunPayAPI import Account
-    from FunPayAPI.types import Balance
+    from FunPayAPI.types import Balance, LotFields
 
 log = logging.getLogger(__name__)
+
+
+def get_lot_fields_safe(acc: "Account", lot_id: int) -> "LotFields":
+    """Like ``Account.get_lot_fields`` but tolerant of FunPay returning raw HTML
+    instead of a ``{"html": ...}`` JSON envelope.
+
+    FunPay's ``lots/offerEdit`` endpoint switched from JSON to plain HTML at
+    some point, which makes the upstream FunPayAPI implementation throw
+    ``JSONDecodeError: Expecting value: line 1 column 1 (char 0)``.  We do the
+    same field-extraction, but parse the raw response text directly.
+    """
+    from FunPayAPI import types as ft
+    from FunPayAPI import exceptions as fexc
+
+    if not acc.is_initiated:
+        raise fexc.AccountNotInitiatedError()
+    headers = {
+        "accept": "*/*",
+        "content-type": "application/json",
+        "x-requested-with": "XMLHttpRequest",
+    }
+    response = acc.method(
+        "get", f"lots/offerEdit?offer={lot_id}", headers, {}, raise_not_200=True
+    )
+    body = response.text or ""
+    # The endpoint may still return JSON in some deployments; handle both.
+    html = body
+    stripped = body.lstrip()
+    if stripped.startswith("{"):
+        try:
+            import json as _json
+            html = _json.loads(stripped).get("html", body)
+        except Exception:
+            html = body
+    bs = BeautifulSoup(html, "html.parser")
+
+    result: dict[str, str] = {"active": "", "deactivate_after_sale": ""}
+    for field in bs.find_all("input"):
+        name = field.get("name")
+        if not name or name in ("active", "deactivate_after_sale"):
+            continue
+        result[name] = field.get("value") or ""
+    for field in bs.find_all("textarea"):
+        name = field.get("name")
+        if not name:
+            continue
+        result[name] = field.text or ""
+    for field in bs.find_all("select"):
+        name = field.get("name")
+        if not name:
+            continue
+        selected = field.find("option", selected=True)
+        if selected is not None and selected.get("value") is not None:
+            result[name] = selected["value"]
+    for field in bs.find_all("input", {"type": "checkbox"}, checked=True):
+        name = field.get("name")
+        if name:
+            result[name] = "on"
+    return ft.LotFields(lot_id, result)
 
 _STATE_BALANCE_LOT_ID = "balance_lot_id"
 
@@ -61,7 +122,252 @@ async def get_balance_safe(
     return None
 
 
+def format_money(value: float | int | None, currency: str = "₽") -> str:
+    """Format a number as a price with space-separated thousands.
+
+    Examples: 1500.0 → "1 500.00 ₽", 83.092 → "83.09 ₽", None → "—".
+    """
+    if value is None:
+        return "—"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    # Russian convention: space as thousands separator, dot as decimal.
+    integer_part, _, frac_part = f"{v:,.2f}".partition(".")
+    integer_part = integer_part.replace(",", " ")
+    formatted = f"{integer_part}.{frac_part}" if frac_part else integer_part
+    return f"{formatted} {currency}".strip()
+
+
 def format_balance(bal: "Balance | None") -> str:
     if bal is None:
         return "—"
-    return f"{bal.total_rub:.2f} ₽ (доступно {bal.available_rub:.2f} ₽)"
+    return f"{format_money(bal.total_rub)} (доступно {format_money(bal.available_rub)})"
+
+
+# ---- lot management helpers (synchronous: call via asyncio.to_thread) ----
+
+
+def list_user_lots(acc: "Account") -> list:
+    """Return the FunPay user's active (publicly visible) lots."""
+    profile = acc.get_user(acc.id)
+    return list(profile.get_lots())
+
+
+def edit_lot(
+    acc: "Account",
+    lot_id: int,
+    *,
+    price: float | None = None,
+    active: bool | None = None,
+    amount: int | None = None,
+    title_ru: str | None = None,
+    description_ru: str | None = None,
+) -> None:
+    """Read a lot, modify the given fields, and save it back."""
+    fields = get_lot_fields_safe(acc, lot_id)
+    if price is not None:
+        fields.price = float(price)
+    if active is not None:
+        fields.active = bool(active)
+    if amount is not None:
+        fields.amount = int(amount)
+    if title_ru is not None:
+        fields.title_ru = title_ru
+    if description_ru is not None:
+        fields.description_ru = description_ru
+    fields.renew_fields()
+    acc.save_lot(fields)
+
+
+def clone_lot(
+    acc: "Account",
+    lot_id: int,
+    *,
+    price: float | None = None,
+    title_ru: str | None = None,
+) -> int:
+    """Duplicate an existing lot. The lot is saved with no offer_id so FunPay
+    treats it as a fresh entity. ``node_id`` (the subcategory) is preserved
+    — without it FunPay rejects the save.
+
+    Returns the new lot's id.
+    """
+    fields = get_lot_fields_safe(acc, lot_id)
+    if price is not None:
+        fields.price = float(price)
+    if title_ru is not None:
+        fields.title_ru = title_ru
+    # Drop only the offer_id — that's what makes save_lot treat this as a new
+    # offer. Keep node_id (subcategory), csrf_token, form_created_at.
+    raw = fields.fields
+    for key in ("offer_id", "offer_id[]"):
+        raw.pop(key, None)
+    fields.lot_id = 0
+    fields.renew_fields()
+    acc.save_lot(fields)
+    # FunPayAPI's save_lot does not return the new id reliably; re-list and
+    # find the matching one by title.
+    profile = acc.get_user(acc.id)
+    target = (title_ru or fields.title_ru or "").strip()
+    for lot in profile.get_lots():
+        if str(lot.description or "").strip() == target:
+            return int(lot.id)
+    return 0
+
+
+def safe_send_message(
+    acc: "Account",
+    chat_id: int,
+    text: str,
+    chat_name: str | None = None,
+) -> None:
+    """Send a chat message via FunPay, tolerating upstream response-parsing
+    crashes.
+
+    FunPayAPI's ``Account.send_message`` POSTs the message and then tries to
+    parse FunPay's response HTML to build a :class:`Message` return object.
+    When FunPay changes the response markup (e.g. drops the
+    ``message-text`` div), the parser raises ``AttributeError: 'NoneType'
+    object has no attribute 'text'`` — but by that point FunPay has already
+    accepted and delivered the message. Since our callers never use the
+    return value, we ignore this specific class of post-send error.
+    """
+    try:
+        acc.send_message(chat_id, text, chat_name=chat_name)
+    except AttributeError as e:
+        # 'NoneType' object has no attribute 'text' is the canonical signature.
+        log.warning(
+            "send_message: ignoring upstream response-parse crash "
+            "(message was delivered): %s", e,
+        )
+
+
+def format_funpay_exc(exc: BaseException, max_len: int = 500) -> str:
+    """Return a short, human-readable error string for a FunPayAPI exception.
+
+    Upstream exceptions like ``LotSavingError`` have a useful ``error_message``
+    attribute but ``str(exc)`` dumps the entire POST body (kilobytes of
+    URL-encoded form data) which blows past Telegram's 4096-char limit.
+    """
+    msg = getattr(exc, "error_message", None) or getattr(exc, "short_str", None)
+    if callable(msg):
+        try:
+            msg = msg()
+        except Exception:
+            msg = None
+    if not msg:
+        msg = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+    msg = str(msg)
+    if len(msg) > max_len:
+        msg = msg[: max_len - 1] + "…"
+    return msg
+
+
+def bump_user_lots(acc: "Account") -> tuple[set[str], set[str]]:
+    """Try to bump every distinct game category the user has lots in.
+
+    Returns ``(bumped_category_names, failed_category_names)``.
+    """
+    bumped: set[str] = set()
+    failed: set[str] = set()
+    try:
+        lots = list_user_lots(acc)
+    except Exception as e:
+        log.warning("bump_user_lots: cannot list lots: %s", e)
+        return bumped, failed
+    seen_categories: dict[int, str] = {}
+    for lot in lots:
+        try:
+            sub = lot.subcategory
+            cat = sub.category
+            seen_categories[int(cat.id)] = str(cat.name)
+        except Exception:
+            continue
+    for cat_id, cat_name in seen_categories.items():
+        try:
+            ok = acc.raise_lots(cat_id)
+            if ok:
+                bumped.add(cat_name)
+            else:
+                failed.add(cat_name)
+        except Exception as e:
+            log.info("raise_lots(%s) failed: %s", cat_id, e)
+            failed.add(cat_name)
+    return bumped, failed
+
+
+def reprice_all(
+    acc: "Account", *, percent: float | None = None, delta: float | None = None
+) -> tuple[int, int]:
+    """Adjust every active lot's price.
+
+    ``percent``: multiply by (1 + percent/100).  ``delta``: add delta to price.
+    Returns ``(updated, failed)``.
+    """
+    if percent is None and delta is None:
+        raise ValueError("reprice_all: pass either percent or delta")
+    updated = 0
+    failed = 0
+    for lot in list_user_lots(acc):
+        try:
+            fields = get_lot_fields_safe(acc, int(lot.id))
+            if fields.price is None:
+                continue
+            new_price = fields.price
+            if percent is not None:
+                new_price = new_price * (1 + percent / 100.0)
+            if delta is not None:
+                new_price = new_price + delta
+            new_price = round(max(new_price, 0.01), 2)
+            fields.price = new_price
+            fields.renew_fields()
+            acc.save_lot(fields)
+            updated += 1
+        except Exception as e:
+            log.warning("reprice_all: lot %s failed: %s", getattr(lot, "id", "?"), e)
+            failed += 1
+    return updated, failed
+
+
+def sum_paid_orders_via_api(acc: "Account", days: int) -> tuple[int, float]:
+    """Fetch finished/refunded orders from FunPay and sum the closed ones for
+    the last ``days`` days.
+
+    Note: FunPay's trade page paginates; we walk up to 5 pages (≈ 100 orders),
+    which is enough for a daily/weekly summary.
+    """
+    import datetime as _dt
+
+    cutoff = _dt.datetime.now(tz=_dt.timezone.utc) - _dt.timedelta(days=days)
+    total_n = 0
+    total_sum = 0.0
+    start_from: str | None = None
+    for _page in range(5):
+        try:
+            start_from, orders = acc.get_sells(
+                start_from=start_from,
+                include_paid=True,
+                include_closed=True,
+                include_refunded=False,
+            )
+        except Exception as e:
+            log.warning("get_sells failed: %s", e)
+            break
+        for o in orders:
+            o_date = o.date
+            if o_date.tzinfo is None:
+                o_date = o_date.replace(tzinfo=_dt.timezone.utc)
+            if o_date < cutoff:
+                start_from = None
+                break
+            status_name = (
+                o.status.name if hasattr(o.status, "name") else str(o.status)
+            )
+            if status_name in ("CLOSED", "PAID"):
+                total_n += 1
+                total_sum += float(o.price)
+        if not start_from:
+            break
+    return total_n, total_sum

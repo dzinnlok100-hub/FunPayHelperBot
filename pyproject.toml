@@ -13,6 +13,7 @@ authors = [{ name = "dzinnlok100" }]
 dependencies = [
     "FunPayAPI>=1.1.0",
     "aiogram>=3.4,<4",
+    "aiohttp-socks>=0.9",
     "aiosqlite>=0.19",
     "python-dotenv>=1.0",
     "cryptography>=42",

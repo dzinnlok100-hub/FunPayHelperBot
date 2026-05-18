@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .db import Database
+from .funpay_helpers import format_money, safe_send_message
 
 if TYPE_CHECKING:
     from FunPayAPI import Account
@@ -21,10 +25,34 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# state keys (centralized here so handlers can reference them)
 STATE_AUTOREPLY_ENABLED = "autoreply_enabled"
 STATE_AUTOREPLY_TEXT = "autoreply_text"
+STATE_AUTOREPLY_QUIET_TEXT = "autoreply_quiet_text"
+STATE_QUIET_ENABLED = "quiet_enabled"
+STATE_QUIET_START_MIN = "quiet_start_min"
+STATE_QUIET_END_MIN = "quiet_end_min"
+STATE_AUTODELIVER_ENABLED = "autodeliver_enabled"
+STATE_AUTOBUMP_ENABLED = "autobump_enabled"
+STATE_AUTOBUMP_LAST_RUN_TS = "autobump_last_run_ts"
+STATE_DIGEST_ENABLED = "digest_enabled"
+STATE_DIGEST_HOUR_UTC = "digest_hour_utc"
+STATE_DIGEST_LAST_SENT_DATE = "digest_last_sent_date"
+STATE_REVIEW_ASK_ENABLED = "review_ask_enabled"
+STATE_REVIEW_ASK_TEXT = "review_ask_text"
+
 DEFAULT_AUTOREPLY_TEXT = (
     "Здравствуйте! Я скоро вернусь и отвечу — обычно в течение 5–10 минут."
+)
+DEFAULT_AUTOREPLY_QUIET_TEXT = (
+    "Здравствуйте! Сейчас у меня нерабочее время, отвечу с утра."
+)
+DEFAULT_REVIEW_ASK_TEXT = (
+    "🙏 Спасибо за покупку, {name}!\n"
+    "Если всё устроило — буду очень благодарен за ⭐⭐⭐⭐⭐ отзыв к заказу: "
+    "{order_url}\n"
+    "Это правда помогает 💛\n"
+    "Если что-то пошло не так — напишите, постараюсь решить."
 )
 
 
@@ -40,6 +68,30 @@ def _truncate(text: str, limit: int = 800) -> str:
     return text[: limit - 1] + "…"
 
 
+async def quiet_hours_active(db: Database, tg_user_id: int) -> bool:
+    """Are quiet hours currently active for this user (in UTC)?"""
+    enabled = await db.get_state(tg_user_id, STATE_QUIET_ENABLED, "0") == "1"
+    if not enabled:
+        return False
+    start = await db.get_state(tg_user_id, STATE_QUIET_START_MIN)
+    end = await db.get_state(tg_user_id, STATE_QUIET_END_MIN)
+    if start is None or end is None:
+        return False
+    try:
+        start_min = int(start)
+        end_min = int(end)
+    except ValueError:
+        return False
+    now = datetime.now(timezone.utc)
+    now_min = now.hour * 60 + now.minute
+    if start_min == end_min:
+        return False
+    if start_min < end_min:
+        return start_min <= now_min < end_min
+    # wraps midnight
+    return now_min >= start_min or now_min < end_min
+
+
 class Notifier:
     """Routes FunPay events to a specific Telegram user."""
 
@@ -47,19 +99,33 @@ class Notifier:
         self.bot = bot
         self.db = db
 
-    async def send(self, tg_user_id: int, text: str) -> bool:
+    async def send(
+        self,
+        tg_user_id: int,
+        text: str,
+        reply_markup: InlineKeyboardMarkup | None = None,
+        disable_notification: bool | None = None,
+    ) -> bool:
         """Send a message to a specific Telegram user. Returns True on success."""
+        if disable_notification is None:
+            disable_notification = await quiet_hours_active(self.db, tg_user_id)
         try:
             await self.bot.send_message(
                 tg_user_id,
                 text,
                 parse_mode="HTML",
                 disable_web_page_preview=True,
+                reply_markup=reply_markup,
+                disable_notification=disable_notification,
             )
             return True
         except TelegramBadRequest as e:
             msg = str(e).lower()
-            if "chat not found" in msg or "blocked by the user" in msg or "user is deactivated" in msg:
+            if (
+                "chat not found" in msg
+                or "blocked by the user" in msg
+                or "user is deactivated" in msg
+            ):
                 log.warning(
                     "Telegram user %s is unreachable (%s) — disabling.",
                     tg_user_id, e,
@@ -72,6 +138,37 @@ class Notifier:
             log.exception("Failed to send Telegram message to %s: %s", tg_user_id, e)
             return False
 
+    async def _build_message_keyboard(
+        self, tg_user_id: int, chat_id: str | int
+    ) -> InlineKeyboardMarkup:
+        """Build an inline keyboard with Reply + up to 5 user templates."""
+        rows: list[list[InlineKeyboardButton]] = []
+        rows.append(
+            [InlineKeyboardButton(text="💬 Ответить", callback_data=f"rpl:{chat_id}")]
+        )
+        templates = await self.db.template_list(tg_user_id)
+        # Use up to 5 templates, 2 per row.
+        templates = templates[:5]
+        if templates:
+            row: list[InlineKeyboardButton] = []
+            for tpl_id, name, _text in templates:
+                # Telegram callback_data limit is 64 bytes. Names are user-defined;
+                # we encode by id only and look up the text server-side.
+                btn_label = f"📝 {name}"[:30]
+                row.append(
+                    InlineKeyboardButton(
+                        text=btn_label, callback_data=f"tpl:{tpl_id}:{chat_id}"
+                    )
+                )
+                if len(row) == 2:
+                    rows.append(row)
+                    row = []
+            if row:
+                rows.append(row)
+        chat_link = f"https://funpay.com/chat/?node={chat_id}"
+        rows.append([InlineKeyboardButton(text="↗️ Открыть на FunPay", url=chat_link)])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
     # ---- event handlers ----
 
     async def handle_new_message(
@@ -82,7 +179,6 @@ class Notifier:
     ) -> None:
         msg = event.message
 
-        # Skip our own outgoing messages and FunPay system messages.
         if msg.author_id == account.id or msg.author_id == 0:
             return
 
@@ -93,29 +189,43 @@ class Notifier:
             log.info("Skipping notification — %s blocked by tg_user=%s", author, tg_user_id)
             return
 
-        chat_link = f"https://funpay.com/chat/?node={msg.chat_id}"
         body = msg.text or ("[изображение] " + (msg.image_link or ""))
         text = (
             "💬 <b>Новое сообщение на FunPay</b>\n"
-            f"От: <b>{_esc(author)}</b>\n"
-            f"Чат: <a href=\"{_esc(chat_link)}\">открыть</a>\n\n"
+            f"От: <b>{_esc(author)}</b>\n\n"
             f"{_esc(_truncate(body))}"
         )
-        await self.send(tg_user_id, text)
+        kb = await self._build_message_keyboard(tg_user_id, msg.chat_id)
+        await self.send(tg_user_id, text, reply_markup=kb)
 
-        # Auto-reply on FunPay (once per chat).
         autoreply_on = (
             await self.db.get_state(tg_user_id, STATE_AUTOREPLY_ENABLED, "0") == "1"
         )
-        if autoreply_on and not await self.db.autoreply_already_sent(tg_user_id, msg.chat_id):
-            reply_text = (
-                await self.db.get_state(
-                    tg_user_id, STATE_AUTOREPLY_TEXT, DEFAULT_AUTOREPLY_TEXT
+        if autoreply_on and not await self.db.autoreply_already_sent(
+            tg_user_id, msg.chat_id
+        ):
+            in_quiet = await quiet_hours_active(self.db, tg_user_id)
+            if in_quiet:
+                reply_text = (
+                    await self.db.get_state(
+                        tg_user_id,
+                        STATE_AUTOREPLY_QUIET_TEXT,
+                        DEFAULT_AUTOREPLY_QUIET_TEXT,
+                    )
+                    or DEFAULT_AUTOREPLY_QUIET_TEXT
                 )
-                or DEFAULT_AUTOREPLY_TEXT
-            )
+            else:
+                reply_text = (
+                    await self.db.get_state(
+                        tg_user_id, STATE_AUTOREPLY_TEXT, DEFAULT_AUTOREPLY_TEXT
+                    )
+                    or DEFAULT_AUTOREPLY_TEXT
+                )
             try:
-                account.send_message(msg.chat_id, reply_text, chat_name=author)
+                await asyncio.to_thread(
+                    safe_send_message,
+                    account, int(msg.chat_id), reply_text, author,
+                )
                 await self.db.mark_autoreply_sent(tg_user_id, msg.chat_id)
                 await self.send(
                     tg_user_id,
@@ -128,9 +238,13 @@ class Notifier:
                     f"⚠️ Не удалось отправить автоответ <b>{_esc(author)}</b>: {_esc(str(e))}",
                 )
 
-    async def handle_new_order(self, tg_user_id: int, event: "NewOrderEvent") -> None:
+    async def handle_new_order(
+        self, tg_user_id: int, account: "Account", event: "NewOrderEvent"
+    ) -> None:
         order = event.order
-        status_name = order.status.name if hasattr(order.status, "name") else str(order.status)
+        status_name = (
+            order.status.name if hasattr(order.status, "name") else str(order.status)
+        )
         await self.db.upsert_order(
             tg_user_id,
             order.id,
@@ -140,29 +254,100 @@ class Notifier:
             status_name,
         )
 
-        if await self.db.is_blocked(tg_user_id, order.buyer_username):
+        if not await self.db.is_blocked(tg_user_id, order.buyer_username):
+            order_link = f"https://funpay.com/orders/{order.id}/"
+            chat_link = f"https://funpay.com/chat/?node=users-{order.buyer_id}"
+            text = (
+                "🛒 <b>Новый заказ на FunPay</b>\n"
+                f"Покупатель: <b>{_esc(order.buyer_username)}</b>\n"
+                f"Лот: {_esc(order.description)}\n"
+                f"Категория: {_esc(order.subcategory_name)}\n"
+                f"Сумма: <b>{_esc(format_money(order.price))}</b>\n"
+                f"Заказ: <a href=\"{_esc(order_link)}\">#{_esc(order.id)}</a>"
+                f" · <a href=\"{_esc(chat_link)}\">чат с покупателем</a>"
+            )
+            await self.send(tg_user_id, text)
+
+        # Auto-deliver (idempotent via delivery_log).
+        autodeliver = (
+            await self.db.get_state(tg_user_id, STATE_AUTODELIVER_ENABLED, "0") == "1"
+        )
+        if not autodeliver:
+            return
+        if status_name != "PAID":
+            return
+        await self._try_autodeliver(tg_user_id, account, order)
+
+    async def _try_autodeliver(
+        self, tg_user_id: int, account: "Account", order
+    ) -> None:
+        popped = await self.db.queue_pop(tg_user_id, str(order.id))
+        if popped is None:
+            count = await self.db.queue_count_available(tg_user_id)
+            if count == 0:
+                await self.send(
+                    tg_user_id,
+                    "⚠️ <b>Авто-выдача:</b> очередь пуста. "
+                    "Пополни командой <code>/queue add &lt;текст&gt;</code> "
+                    f"(заказ <code>#{_esc(order.id)}</code> покупателю "
+                    f"<b>{_esc(order.buyer_username)}</b> остался без выдачи).",
+                )
+            return
+        _qid, content = popped
+
+        # Find the chat with the buyer.
+        chat_id_to_send: int | None = None
+        try:
+            shortcut = await asyncio.to_thread(
+                lambda: account.get_chat_by_name(order.buyer_username, make_request=True)
+            )
+            if shortcut is not None:
+                chat_id_to_send = int(shortcut.id)
+        except Exception as e:
+            log.exception("get_chat_by_name failed for autodeliver: %s", e)
+
+        if chat_id_to_send is None:
+            await self.send(
+                tg_user_id,
+                "⚠️ <b>Авто-выдача:</b> не смог найти чат с "
+                f"<b>{_esc(order.buyer_username)}</b>. Сообщение положено обратно "
+                "(/queue list).",
+            )
             return
 
-        order_link = f"https://funpay.com/orders/{order.id}/"
-        chat_link = f"https://funpay.com/chat/?node=users-{order.buyer_id}"
-        text = (
-            "🛒 <b>Новый заказ на FunPay</b>\n"
+        try:
+            await asyncio.to_thread(
+                safe_send_message,
+                account, chat_id_to_send, content, order.buyer_username,
+            )
+        except Exception as e:
+            log.exception("Autodeliver send_message failed: %s", e)
+            await self.send(
+                tg_user_id,
+                f"❌ <b>Авто-выдача не доставлена</b> покупателю "
+                f"<b>{_esc(order.buyer_username)}</b>: <code>{_esc(str(e))}</code>",
+            )
+            return
+
+        await self.send(
+            tg_user_id,
+            "📤 <b>Авто-выдача отправлена</b>\n"
             f"Покупатель: <b>{_esc(order.buyer_username)}</b>\n"
-            f"Лот: {_esc(order.description)}\n"
-            f"Категория: {_esc(order.subcategory_name)}\n"
-            f"Сумма: <b>{order.price:.2f} ₽</b>"
-            + (f" × {order.amount}" if order.amount else "")
-            + "\n"
-            f"Заказ: <a href=\"{_esc(order_link)}\">#{_esc(order.id)}</a>"
-            f" · <a href=\"{_esc(chat_link)}\">чат с покупателем</a>"
+            f"Заказ: <code>#{_esc(order.id)}</code>\n"
+            f"Отправлено: <pre>{_esc(_truncate(content, 400))}</pre>\n"
+            f"Осталось в очереди: <b>{await self.db.queue_count_available(tg_user_id)}</b>",
         )
-        await self.send(tg_user_id, text)
 
     async def handle_order_status_changed(
-        self, tg_user_id: int, event: "OrderStatusChangedEvent"
+        self,
+        tg_user_id: int,
+        account: "Account",
+        event: "OrderStatusChangedEvent",
     ) -> None:
         order = event.order
-        status_name = order.status.name if hasattr(order.status, "name") else str(order.status)
+        status_name = (
+            order.status.name if hasattr(order.status, "name") else str(order.status)
+        )
         await self.db.upsert_order(
             tg_user_id,
             order.id,
@@ -174,14 +359,103 @@ class Notifier:
 
         emoji = {"CLOSED": "✅", "PAID": "💰", "REFUNDED": "↩️"}.get(status_name, "🔁")
         order_link = f"https://funpay.com/orders/{order.id}/"
+        extra = ""
+        if status_name == "REFUNDED":
+            extra = (
+                "\n\n⚠️ <b>Внимание: возврат.</b> "
+                "Если деньги уже списаны с твоего баланса — проверь, был ли отправлен "
+                "товар."
+            )
         text = (
-            f"{emoji} <b>Статус заказа изменён: {_esc(status_name)}</b>\n"
+            f"{emoji} <b>Статус заказа: {_esc(status_name)}</b>\n"
             f"Покупатель: <b>{_esc(order.buyer_username)}</b>\n"
             f"Лот: {_esc(order.description)}\n"
-            f"Сумма: <b>{order.price:.2f} ₽</b>\n"
+            f"Сумма: <b>{_esc(format_money(order.price))}</b>\n"
             f"Заказ: <a href=\"{_esc(order_link)}\">#{_esc(order.id)}</a>"
+            f"{extra}"
         )
         await self.send(tg_user_id, text)
+
+        # On CLOSED (buyer confirmed receipt) — ask for a review, idempotently.
+        if status_name == "CLOSED":
+            await self._maybe_send_review_ask(tg_user_id, account, order)
+
+    async def _maybe_send_review_ask(
+        self, tg_user_id: int, account: "Account", order
+    ) -> None:
+        enabled = (
+            await self.db.get_state(tg_user_id, STATE_REVIEW_ASK_ENABLED, "0") == "1"
+        )
+        if not enabled:
+            return
+        if await self.db.review_ask_already_sent(tg_user_id, str(order.id)):
+            return
+        if await self.db.is_blocked(tg_user_id, order.buyer_username):
+            return
+
+        template = (
+            await self.db.get_state(
+                tg_user_id, STATE_REVIEW_ASK_TEXT, DEFAULT_REVIEW_ASK_TEXT
+            )
+            or DEFAULT_REVIEW_ASK_TEXT
+        )
+        order_url = f"https://funpay.com/orders/{order.id}/"
+        try:
+            msg_text = template.format(
+                name=order.buyer_username,
+                order=order.id,
+                order_url=order_url,
+                lot=order.description or "",
+            )
+        except (KeyError, IndexError, ValueError) as e:
+            log.warning("review-ask template format failed for tg_user=%s: %s", tg_user_id, e)
+            msg_text = DEFAULT_REVIEW_ASK_TEXT.format(
+                name=order.buyer_username,
+                order=order.id,
+                order_url=order_url,
+                lot=order.description or "",
+            )
+
+        chat_id_to_send: int | None = None
+        try:
+            shortcut = await asyncio.to_thread(
+                lambda: account.get_chat_by_name(order.buyer_username, make_request=True)
+            )
+            if shortcut is not None:
+                chat_id_to_send = int(shortcut.id)
+        except Exception as e:
+            log.exception("review-ask get_chat_by_name failed: %s", e)
+
+        if chat_id_to_send is None:
+            await self.send(
+                tg_user_id,
+                "⚠️ <b>Запрос отзыва не отправлен:</b> не нашёл чат с "
+                f"<b>{_esc(order.buyer_username)}</b> (заказ "
+                f"<code>#{_esc(order.id)}</code>).",
+            )
+            return
+
+        try:
+            await asyncio.to_thread(
+                safe_send_message,
+                account, chat_id_to_send, msg_text, order.buyer_username,
+            )
+        except Exception as e:
+            log.exception("review-ask send_message failed: %s", e)
+            await self.send(
+                tg_user_id,
+                "❌ <b>Не удалось отправить запрос отзыва</b> покупателю "
+                f"<b>{_esc(order.buyer_username)}</b>: <code>{_esc(str(e))}</code>",
+            )
+            return
+
+        await self.db.mark_review_ask_sent(tg_user_id, str(order.id))
+        await self.send(
+            tg_user_id,
+            "⭐ <b>Запрос отзыва отправлен</b>\n"
+            f"Покупатель: <b>{_esc(order.buyer_username)}</b>\n"
+            f"Заказ: <code>#{_esc(order.id)}</code>",
+        )
 
     async def handle_runner_error(self, tg_user_id: int, exc: BaseException) -> None:
         text = (

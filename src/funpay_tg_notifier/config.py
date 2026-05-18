@@ -17,6 +17,7 @@ class Settings:
     funpay_poll_delay: float
     db_path: Path
     log_level: str
+    telegram_proxy: str | None
 
 
 def _required(name: str) -> str:
@@ -40,6 +41,8 @@ def load_settings() -> Settings:
     admin_raw = os.environ.get("ADMIN_TG_USER_ID", "").strip()
     admin_id = int(admin_raw) if admin_raw else None
 
+    proxy = os.environ.get("TELEGRAM_PROXY", "").strip() or None
+
     return Settings(
         telegram_token=_required("TELEGRAM_BOT_TOKEN"),
         admin_tg_user_id=admin_id,
@@ -47,4 +50,5 @@ def load_settings() -> Settings:
         funpay_poll_delay=float(os.environ.get("FUNPAY_POLL_DELAY", "2")),
         db_path=db_path,
         log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        telegram_proxy=proxy,
     )

@@ -7,6 +7,7 @@ import logging
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from .background import background_loop
@@ -33,9 +34,16 @@ async def _amain() -> None:
     db = Database(settings.db_path, cipher)
     await db.init()
 
+    session = None
+    if settings.telegram_proxy:
+        # SOCKS5/HTTPS proxy support (for environments where direct outbound to
+        # api.telegram.org is blocked, e.g. some Russian providers).
+        log.info("Routing Telegram API through proxy: %s", _redact_proxy(settings.telegram_proxy))
+        session = AiohttpSession(proxy=settings.telegram_proxy)
     bot = Bot(
         token=settings.telegram_token,
         default=DefaultBotProperties(parse_mode="HTML"),
+        session=session,
     )
     dp = Dispatcher(storage=MemoryStorage())
     notifier = Notifier(bot, db)
@@ -82,6 +90,23 @@ async def _amain() -> None:
             bg_task.cancel()
         registry.stop_all()
         await bot.session.close()
+
+
+def _redact_proxy(url: str) -> str:
+    """Mask credentials inside a proxy URL for safe logging."""
+    try:
+        # scheme://user:pass@host:port  ->  scheme://***:***@host:port
+        if "://" not in url:
+            return url
+        scheme, rest = url.split("://", 1)
+        if "@" in rest:
+            creds, host = rest.split("@", 1)
+            if ":" in creds:
+                return f"{scheme}://***:***@{host}"
+            return f"{scheme}://***@{host}"
+        return url
+    except Exception:
+        return "<proxy>"
 
 
 def run() -> None:
